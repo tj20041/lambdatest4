@@ -30,18 +30,19 @@ class TokenInspectionEngine:
 
     def validate_scopes(self, token_claims: Dict[str, Any]) -> bool:
         logger.info(f"Evaluating claims for subject: {token_claims.get('sub')}")
-        
-        # Claims can have scopes formatted as a space-separated string (RFC 6749 standard)
-        # e.g., "orders:read orders:write reports:export"
-        scopes = token_claims.get("scope", "")
-        
-        resolved_actions = []
-        # FAILS HERE: The code treats 'scopes' as an iterable list of dict permission objects
-        # Iterating over string yields individual characters, or calling .get() on elements fails
-        for scope_entry in scopes:
-            # scope_entry is a 1-character string: AttributeError: 'str' object has no attribute 'get'
-            action_name = scope_entry.get("action")
-            resolved_actions.append(action_name)
+
+        # Scopes are a space-delimited string per RFC 6749 (e.g. "orders:read orders:write").
+        # We split on whitespace to obtain a list of individual scope token strings before
+        # checking permissions. No dict key lookup is needed — each token IS the scope string.
+        scope_value = token_claims.get("scope", "")
+
+        # Guard against missing, None, or non-string scope claim to avoid a secondary crash
+        # if the JWT payload is malformed or the claim type changes in future.
+        if not isinstance(scope_value, str):
+            logger.warning("Unexpected scope claim type: %s — denying access", type(scope_value))
+            return False
+
+        resolved_actions = scope_value.split()
 
         return all(perm in resolved_actions for perm in self.required_permissions)
 
@@ -65,9 +66,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     token = raw_header.replace("Bearer ", "").strip()
 
     engine = TokenInspectionEngine(required_permissions=["orders:read"])
-    claims = engine.decode_token_payload(token)
-    
-    is_authorized = engine.validate_scopes(claims)
+
+    try:
+        claims = engine.decode_token_payload(token)
+        is_authorized = engine.validate_scopes(claims)
+    except Exception as exc:
+        logger.error("Authorization evaluation failed: %s", exc, exc_info=True)
+        return {
+            "statusCode": 500,
+            "error": "authorization_evaluation_failed",
+            "detail": str(exc)
+        }
+
     logger.info(f"Authorization verdict: {is_authorized}")
 
     return {
