@@ -28,22 +28,43 @@ class TokenInspectionEngine:
         decoded_bytes = base64.urlsafe_b64decode(payload_segment)
         return json.loads(decoded_bytes.decode("utf-8"))
 
+    def verify_expiry(self, token_claims: Dict[str, Any]) -> bool:
+        """Check the exp claim. Returns False if the token has expired."""
+        exp = token_claims.get("exp", 0)
+        if time.time() > exp:
+            logger.warning("Token has expired (exp=%s, now=%s)", exp, int(time.time()))
+            return False
+        return True
+
     def validate_scopes(self, token_claims: Dict[str, Any]) -> bool:
-        logger.info(f"Evaluating claims for subject: {token_claims.get('sub')}")
-        
-        # Claims can have scopes formatted as a space-separated string (RFC 6749 standard)
-        # e.g., "orders:read orders:write reports:export"
-        scopes = token_claims.get("scope", "")
-        
-        resolved_actions = []
-        # FAILS HERE: The code treats 'scopes' as an iterable list of dict permission objects
-        # Iterating over string yields individual characters, or calling .get() on elements fails
-        for scope_entry in scopes:
-            # scope_entry is a 1-character string: AttributeError: 'str' object has no attribute 'get'
-            action_name = scope_entry.get("action")
-            resolved_actions.append(action_name)
+        """Validate that all required_permissions are present in the JWT scope claim.
+
+        The 'scope' claim is a standard RFC 6749 space-delimited string,
+        e.g. 'orders:read orders:write reports:export'.
+        This method splits that string on whitespace and checks membership.
+        """
+        # Guard: token_claims must be a dict
+        if not isinstance(token_claims, dict):
+            raise TypeError(
+                f"token_claims must be dict, got {type(token_claims).__name__}"
+            )
+
+        logger.info("Evaluating claims for subject: %s", token_claims.get("sub"))
+
+        # Verify token has not expired before evaluating scopes
+        if not self.verify_expiry(token_claims):
+            return False
+
+        # The scope claim is a space-separated string per RFC 6749.
+        # Split on whitespace and strip to obtain individual scope identifiers.
+        scopes_raw = token_claims.get("scope", "")
+        resolved_actions = [s.strip() for s in scopes_raw.split() if s.strip()]
+
+        logger.info("Resolved scopes from token: %s", resolved_actions)
+        logger.info("Required permissions: %s", self.required_permissions)
 
         return all(perm in resolved_actions for perm in self.required_permissions)
+
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Starting Lambda custom authorizer evaluation...")
@@ -66,9 +87,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     engine = TokenInspectionEngine(required_permissions=["orders:read"])
     claims = engine.decode_token_payload(token)
-    
-    is_authorized = engine.validate_scopes(claims)
-    logger.info(f"Authorization verdict: {is_authorized}")
+
+    # Wrap scope validation in a try/except so API Gateway always receives a
+    # well-formed policy document rather than an opaque Lambda 500 error.
+    try:
+        is_authorized = engine.validate_scopes(claims)
+    except Exception as exc:
+        logger.error("Scope validation error: %s", exc)
+        is_authorized = False
+
+    logger.info("Authorization verdict: %s", is_authorized)
 
     return {
         "principalId": claims.get("sub"),
